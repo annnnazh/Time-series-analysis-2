@@ -1,0 +1,306 @@
+---
+title: "BVAR"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r zero, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+
+install.packages("openxlsx")
+install.packages("BVAR")
+install.packages("forecast")
+install.packages("modelsummary")
+install.packages("dplyr")
+install.packages("tseries")
+install.packages("ggplot2")
+install.packages("reshape2")
+
+
+```
+
+```{r upload, include=FALSE, message= FALSE, comment = "",warning=FALSE}
+library(openxlsx)
+library(BVAR)
+library(forecast)
+library(modelsummary)
+library(dplyr)
+library(tseries)
+library(ggplot2)
+library(reshape2)
+
+dd <- read.xlsx("TS_data.xlsx",sheet = "Sheet1")
+
+dd=dd[with(dd, order(id,year,month)), ]
+
+dd_grouped_by_region = (dd %>% group_by(id,region) %>%
+                summarize(month_count=n()))
+
+
+```
+Анализ BVAR будет произведен на основании данных о доходах и расходах бюджета, а также ИПП по г. Москва.
+
+```{r data, results='markup', message= FALSE,warning=FALSE}
+df = dd[dd$region=='г. Москва',]
+
+TSspend = ts(df$spend, start = c(2014,1), frequency = 12)
+TSincome = ts(df$income, start = c(2014,1), frequency = 12)
+TSipp = ts(df$ipp, start = c(2014,1), frequency = 12)
+
+plot(TSincome)
+plot(TSspend)
+plot(TSipp)
+
+##### Проверка на стационарность 
+
+adf.test(df$ipp) #p-value = 0.04 - стационарны с 5% значимостью
+pp.test(df$ipp) #p-value = 0.01 - стационарны
+kpss.test(df$ipp) #p-value = 0.1 - стационарны с 5% значимостью
+
+adf.test(diff(df$ipp)) #p-value = 0.01 - стационарны
+pp.test(diff(df$ipp)) #p-value = 0.01 - стационарны
+kpss.test(diff(df$ipp)) #p-value = 0.1 - стационарны с 5% значимостью
+
+adf.test(diff(df$spend)) #p-value = 0.01 - стационарны
+pp.test(diff(df$spend)) #p-value = 0.01 - стационарны
+kpss.test(diff(df$spend)) #p-value = 0.1 - стационарны с 5% значимостью
+
+adf.test(diff(df$income)) #p-value = 0.01 - стационарны
+pp.test(diff(df$income)) #p-value = 0.01 - стационарны
+kpss.test(diff(df$income)) #p-value = 0.1 - стационарны с 5% значимостью
+
+
+autoplot(diff(TSspend))
+autoplot(diff(TSincome))
+
+d_TSspend = diff(TSspend)
+d_TSincome = diff(TSincome)
+d_TSipp = diff(TSipp)
+
+# После перехода к разницам все данные стацонарны
+
+# Подготавливаем данные для VAR
+
+dataForVAR = data.frame(d_income = d_TSincome/1000,
+                        d_spend = d_TSspend/1000,
+                        d_ipp = d_TSipp)
+dataExog = data.frame(MIACR = df$MIACR[2:96],
+                      BRENT = df$BRENT[2:96]/100)
+
+summary(dataForVAR)
+summary(dataExog)
+
+sum(is.na(dataForVAR))
+sum(is.na(dataExog))
+
+dataForVAR <- scale(dataForVAR)
+dataExog <- scale(dataExog)
+
+dataTotal = cbind(dataForVAR,dataExog)
+
+
+```
+## Оценим BVAR со стартовыми значениями гиперпараметров. Используется априорное распределение Миннесота.
+
+```{r BVAR1, results='markup', message= FALSE,warning=FALSE}
+
+minnPrior <- bv_minnesota(
+  lambda = bv_lambda(mode = 0.5, sd = 0.00001), 
+  alpha = bv_alpha(mode = 3, sd = 0.00001), 
+  psi = bv_psi(scale = 0.001, shape = 0.002))
+
+bvPrior_Object <- bv_priors(mn = minnPrior)
+
+m <- bvar(data = dataTotal, lags = 12, 
+          priors = bvPrior_Object, verbose = FALSE)
+m
+```
+
+## Построим IRF и FEVD полученной модели без введения ограничений на импульсные отклики.
+
+```{r IRF1, results='markup', message= FALSE,warning=FALSE}
+
+bv_irf_m__no_restrictionts=bv_irf(
+  horizon = 24,
+  fevd = TRUE,
+  identification = FALSE,
+  sign_restr = NULL,
+  sign_lim = 1000
+)
+
+plot(irf(m,value=bv_irf_m__no_restrictionts,conf_bands = c(0.05, 0.1)))
+```
+Как можно заметить для Индекса промышленного производства (d_ipp) значимыми для 3го месяца (квартал) являются шоки госрасходов (d_spend). Шоки налоговых доходов (d_income) являются значимыми только для второго месяца. Прочие импульсные отклики представляются либо не значимыми, либо нелогичными, что обусловлено отсутствием введенных ограничений (шоки доходов на нефть, фактические ставки по кредитам).
+
+Рассмотрим FEVD данной модели используя значения входящие в 95% доверительный интервал:
+```{r FEVD1, results='markup', message= FALSE,warning=FALSE}
+
+fevd_m__no_restrictionts=fevd(m,value=bv_irf_m__no_restrictionts, n_thin = 1L,conf_bands = c(0.05, 0.1))
+df_fevd_m__no_restrictionts=data.frame(melt(fevd_m__no_restrictionts$quants[5,,,])) # 5 - 95%
+colnames(df_fevd_m__no_restrictionts)=c('variables','horizon','variables_shocks','value')
+df_fevd_m__no_restrictionts=merge(df_fevd_m__no_restrictionts,
+                                  cbind(variables = rownames(melt(fevd_m__no_restrictionts$variables)),melt(fevd_m__no_restrictionts$variables,value.name='variables_name')), by = "variables")
+df_fevd_m__no_restrictionts=merge(df_fevd_m__no_restrictionts,
+                                  cbind(variables_shocks=rownames(melt(fevd_m__no_restrictionts$variables)),melt(fevd_m__no_restrictionts$variables,value.name='variables_shocks_name'))
+                                  , by = "variables_shocks")
+ggplot(df_fevd_m__no_restrictionts,aes(x = horizon, y = value, fill = variables_shocks_name)) + theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) +  geom_col(position = "stack") + facet_grid(variables_name ~ .)
+```
+Анализируя FEVD можем заметить, что для d_ipp со временем возрастает вклад как расходов, так и доходов. При этом эффекта от шоков цены на нефть и ставок по кредитам для d_ipp не наблюдается. Также можно заметить, что шоки доходов сильнее влияют на d_spend, чем шоки расходов на d_income, что представляется логичным и согласуется с теорией.
+
+В то же время в дисперсию экзогенных переменных (BRENT,MIACR) значимый вклад вносят и расходы, доходы и ИПП, что является следствием отсутствий ограничений на отклики.
+
+## Рассмотрим IRF и FEVD полученной модели с учетом введения ограничений на импульсные отклики.
+В рассмотренных статьях (в частности - Власов С., Дерюгина Е. Фискальные мультипликаторы в России / Банк России) предлагается следующие ограничения на отклики:
+```{r table2, echo=FALSE, message=FALSE, warnings=FALSE, results='asis'}
+tabl <- "
+| Шок        | ВВП           | Доходы  | Расходы  |  ВВП Евросоюза  | Рублевая цена нефти |
+|------------|:-------------:|:-------:|:--------:|:---------------:|:-------------------:|  
+| Доходов    |  -            | +       | >=0      | 0               |  0                  |
+| Расходов   |  +            | >= 0    | +        | 0               |  0                  |  
+"
+cat(tabl)
+```
+Исходя из приведенных выше ограничений и ограничений пакет вводим матрицу ограничений:
+```{r tabl2, echo=FALSE, message=FALSE, warnings=FALSE, results='asis'}
+
+tabl2 <- "
+| Шок        | ИПП           | Доходы  | Расходы  | Ставки по кредитам | Цена нефти          |
+|------------|:-------------:|:-------:|:--------:|:------------------:|:-------------------:|   
+| Доходов    |  -            | +       | >=0      |  0                 | 0                   |
+| Расходов   |  +            | >= 0    | +        |  0                 | 0                   |
+| ИПП        |  +            | +       | 0        |  >=0               | 0                   |
+| Ставок     |  -            | -       | >=0      |  +                 | >=0                 |
+| Цены нефти |  +            | +       | >=0      |  -                 | +
+"
+cat(tabl2)
+
+```
+```{r FEVD2, results='markup', message= FALSE,warning=FALSE}
+
+struct_matrix_v1 = matrix(c(1, NA, 1, -1, 1,
+                          NA, 1, 0, NA, NA,
+                          -1, 1, 1, -1, 1,
+                          0, 0, NA, 1, -1,
+                          0, 0, 0, NA, 1
+                          ), byrow = TRUE,ncol = 5)
+bv_irf_m__with_restrictionts_v1=bv_irf(
+  horizon = 24,
+  fevd = TRUE,
+  identification = TRUE,
+  sign_restr = struct_matrix_v1,
+  sign_lim = 10000
+)
+# bv_irf_m__with_restrictionts_v1=bv_irf(
+#   horizon = 24,
+#   fevd = TRUE,
+#   identification = TRUE,
+#   sign_restr = struct_matrix_v1,
+#   sign_lim = 50000
+# )
+# plot(irf(m,value=bv_irf_m__with_restrictionts_v1, conf_bands = c(0.05, 0.1)))
+# fevd_m__with_restrictionts_v1=fevd(m,value=bv_irf_m__with_restrictionts_v1,conf_bands = c(0.05, 0.1))
+
+```
+Однако с подобными ограничениями матрица не может быть подобрана в указанное число итераций. При увеличении числа итераций в 5 раз так же IRF и FEVD так же не могут быть построены.
+
+Попробуем уменьшить число переменных для формирования IRF и FEVD с ограничениями;
+```{r BVAR2, results='markup', message= FALSE,warning=FALSE}
+
+dataForVAR = data.frame(
+                        d_income = d_TSincome/1000,
+                        d_ipp = d_TSipp,
+                        d_spend = d_TSspend/1000
+                        )
+
+minnPrior <- bv_minnesota(
+  lambda = bv_lambda(mode = 0.5, sd = 0.00001), 
+  alpha = bv_alpha(mode = 3, sd = 0.00001), 
+  psi = bv_psi(scale = 0.001, shape = 0.002))
+
+bvPrior_Object <- bv_priors(mn = minnPrior)
+
+m2 <- bvar(data = dataForVAR, lags = 12, 
+          priors = bvPrior_Object,verbose = FALSE)
+```
+Предполагаем что d_spend влияет на d_ipp и d_income, d_income влияет только на себя, d_ipp влияет на d_income
+
+```{r IRF_FEVD3, results='markup', message= FALSE,warning=FALSE}
+
+struct_matrix_v1 = matrix(c(1, 1, NA,
+                            0, 1, 1,
+                            0, 0, 1
+), byrow = TRUE,ncol = 3)
+
+bv_irf_m__with_restrictionts_v1=bv_irf(
+  horizon = 24,
+  fevd = TRUE,
+  identification = TRUE,
+  sign_restr = struct_matrix_v1,
+  sign_lim = 50000
+)
+
+# plot(irf(m2,value=bv_irf_m__with_restrictionts_v1,conf_bands = c(0.05, 0.1)))
+# fevd_m__with_restrictionts_v1=fevd(m2,value=bv_irf_m__with_restrictionts_v1,conf_bands = c(0.05, 0.1))
+```
+Получаем аналогичный неутешительный результат.
+
+Пробмуем иную комбинацию ограничений:
+Предполагаем что d_spend влияет на d_ipp и d_income, d_income влияет только на себя и негативно на d_ipp, d_ipp влияет на d_income
+
+```{r IRF_FEVD4, results='markup', message= FALSE,warning=FALSE}
+
+struct_matrix_v1 = matrix(c(1, 1, 1,
+                            -1, 1, 1,
+                            0, 0, 1
+), byrow = TRUE,ncol = 3)
+
+bv_irf_m__with_restrictionts_v1=bv_irf(
+  horizon = 24,
+  fevd = TRUE,
+  identification = TRUE,
+  sign_restr = struct_matrix_v1,
+  sign_lim = 50000
+)
+
+# plot(irf(m2,value=bv_irf_m__with_restrictionts_v1,conf_bands = c(0.05, 0.1)))
+# fevd_m__with_restrictionts_v1=fevd(m2,value=bv_irf_m__with_restrictionts_v1,conf_bands = c(0.05, 0.1))
+```
+Аналогично построить IRF и FEVD с учетом этого ограничения не удалось.
+
+## Произведем настройку гиперпараметров на кроссвалидации на 12 точках (год)
+
+```{r CV, results='markup', message= FALSE,warning=FALSE}
+errMat <- matrix(nrow = 12, ncol = 12)
+dataTotalCV = data.frame(dataTotal[1:84,])
+
+for (i in 1:12){
+  minnPrior <- bv_minnesota(
+    lambda = bv_lambda(mode = 0.5, sd = 0.00001), 
+    alpha = bv_alpha(mode = 3, sd = 0.00001), 
+    psi = bv_psi(scale = 0.001, shape = 0.002, mode = rep(1, ncol(dataTotalCV))))
+  
+  bvPrior_Object <- bv_priors(mn = minnPrior)
+  
+  m <- bvar(data = dataTotalCV[1:(nrow(dataTotalCV) - i - 11), ], lags = 4, 
+            priors = bvPrior_Object,verbose = FALSE)
+  bvarForecasts <- predict(m)
+  
+  bvarForecasts$fcast[,,3]
+  
+  ipp_allForecasts <- bvarForecasts$fcast[,,3]
+  median_ipp_forecast <- apply(ipp_allForecasts, 2, median)
+  
+  errMat[i, ] <- median_ipp_forecast - 
+    dataTotalCV$d_ipp[(nrow(dataTotalCV) - i - 10):(nrow(dataTotalCV) - i + 1)]
+}
+
+errMat_naive <- matrix(nrow = 12, ncol = 12)
+for (i in 1:12){
+  errMat_naive[i, ] <- dataTotalCV$d_ipp[(nrow(dataTotalCV) - i - 11)] - 
+    dataTotalCV$d_ipp[(nrow(dataTotalCV) - i - 10):(nrow(dataTotalCV) - i + 1)]
+}
+
+#MASE
+plot(colMeans(abs(errMat)) / colMeans(abs(errMat_naive)))
+```
+Исходя из значения метрики MASE, можем видеть, что прогноз по BVAR лучше наивного.
